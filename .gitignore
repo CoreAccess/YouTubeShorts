@@ -1,0 +1,6 @@
+/.venv
+/.__app.lock
+/app.log
+/app.log.1
+/uploads
+/__pycache__

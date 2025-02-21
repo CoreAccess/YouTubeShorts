@@ -1,0 +1,12 @@
+Flask
+Werkzeug
+numpy
+torch
+transformers
+librosa
+moviepy
+whisper
+concurrent-log-handler
+faster-whisper
+tqdm
+matplotlib
