@@ -4,3 +4,7 @@
 /app.log.1
 /uploads
 /__pycache__
+audio/__pycache__
+nlp/__pycache__
+video/__pycache__
+.env

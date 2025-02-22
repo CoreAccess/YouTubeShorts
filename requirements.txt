@@ -1,12 +1,13 @@
 Flask
 Werkzeug
 numpy
-torch
 transformers
 librosa
-moviepy
-whisper
-concurrent-log-handler
+moviepy==2.0.0.dev2
 faster-whisper
 tqdm
 matplotlib
+pyannote.audio>=0.0.1
+python-dotenv
+soundfile
+huggingface-hub

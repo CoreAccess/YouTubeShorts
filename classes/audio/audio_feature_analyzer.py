@@ -6,6 +6,11 @@ from typing import Dict, List, Tuple
 from dataclasses import dataclass
 from classes.util.progress_tracker import ProgressTracker, ProcessingStage
 
+# Configure logging for librosa and soundfile
+logging.getLogger('librosa').setLevel(logging.ERROR)
+logging.getLogger('soundfile').setLevel(logging.ERROR)
+logging.getLogger('numba').setLevel(logging.ERROR)
+
 @dataclass
 class AudioFeatures:
     start: float  # Changed from start_time for consistency

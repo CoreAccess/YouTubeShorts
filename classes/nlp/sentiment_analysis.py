@@ -12,11 +12,13 @@ import sys
 @dataclass
 class SentimentResult:
     text: str
-    start: float       # Changed from start_time for consistency
-    end: float         # Changed from end_time for consistency
+    start: float
+    end: float
     sentiment: str
     score: float
-    context_score: Optional[float] = None  # Added for contextual scoring
+    speaker: str  # Added speaker field
+    context_score: Optional[float] = None
+    conversation_id: Optional[str] = None  # Added to track conversation groups
 
 class SentimentAnalysis:
     def __init__(self, progress_tracker: ProgressTracker = None):
@@ -51,6 +53,11 @@ class SentimentAnalysis:
             'disgust': 1.1,
             'neutral': 0.8
         }
+        self.max_silence_between_speakers = 2.0  # Increased from 1.0
+        self.min_segment_duration = 40.0  # Reduced from 50.0
+        self.max_segment_duration = 90.0  # Increased from 65.0
+        self.target_duration = 60.0  # Target duration for segments
+        self.min_speaker_turns = 1  # Reduced from 2 to allow single-speaker segments
 
     def analyze_transcript(self, transcript_path: str, temp_dir: str) -> str:
         """
@@ -84,6 +91,13 @@ class SentimentAnalysis:
             with open(transcript_path, 'r', encoding='utf-8') as f:
                 transcript_data = json.load(f)
             
+            # Check if speaker information already exists
+            has_speaker_info = any('speaker' in segment for segment in transcript_data.get('segments', []))
+            if not has_speaker_info:
+                self.logger.warning("No speaker information found in transcript. Speaker diarization may be required.")
+            else:
+                self.logger.info("Using existing speaker information from transcript")
+            
             self.logger.debug(f"Processing {len(transcript_data['segments'])} transcript segments")
             
             # Group segments
@@ -100,32 +114,41 @@ class SentimentAnalysis:
             # Process grouped segments
             results = []
             for i, group in enumerate(tqdm(grouped_segments, desc="Analyzing sentiment")):
-                # Combine text while keeping timing info
-                combined_text = " ".join([seg['text'] for seg in group])
-                start = group[0]['start']    # Updated variable name
-                end = group[-1]['end']       # Updated variable name
+                # Group segments by speaker
+                speaker_segments = {}
+                for seg in group:
+                    speaker = seg.get('speaker', 'UNKNOWN')
+                    if speaker not in speaker_segments:
+                        speaker_segments[speaker] = []
+                    speaker_segments[speaker].append(seg)
                 
-                # Process text through sentiment analysis
-                sentiment = self._analyze_text(combined_text)
+                conversation_id = f"conv_{i}"
                 
-                # Get contextual score by looking at surrounding segments
-                context_score = self._calculate_context_score(
-                    i, grouped_segments, sentiment['label']
-                )
-                
-                # Apply emotion weight to the score
-                weighted_score = sentiment['score'] * self.emotion_weights.get(
-                    sentiment['label'].lower(), 1.0
-                )
-                
-                results.append(SentimentResult(
-                    text=combined_text,
-                    start=start,             # Updated field name
-                    end=end,                 # Updated field name
-                    sentiment=sentiment['label'],
-                    score=weighted_score,
-                    context_score=context_score
-                ).__dict__)
+                # Analyze each speaker's contribution separately
+                for speaker, segs in speaker_segments.items():
+                    combined_text = " ".join([seg['text'] for seg in segs])
+                    if not combined_text.strip():
+                        continue
+                        
+                    sentiment = self._analyze_text(combined_text)
+                    context_score = self._calculate_context_score(
+                        i, grouped_segments, sentiment['label']
+                    )
+                    
+                    weighted_score = sentiment['score'] * self.emotion_weights.get(
+                        sentiment['label'].lower(), 1.0
+                    )
+                    
+                    results.append(SentimentResult(
+                        text=combined_text,
+                        start=segs[0]['start'],
+                        end=segs[-1]['end'],
+                        sentiment=sentiment['label'],
+                        score=weighted_score,
+                        speaker=speaker,
+                        context_score=context_score,
+                        conversation_id=conversation_id
+                    ).__dict__)
                 
                 if self.progress_tracker:
                     progress = (i + 1) / len(grouped_segments)
@@ -166,32 +189,74 @@ class SentimentAnalysis:
 
     def _group_segments(self, segments: List[Dict]) -> List[List[Dict]]:
         """
-        Group segments together for better contextual analysis.
-        Groups are formed based on timing and natural breaks.
+        Group segments into conversations based on speaker changes and timing.
+        Ensures proper conversation boundaries and maintains speaker coherence.
         """
         grouped = []
         current_group = []
+        current_speakers = set()
+        current_conversation_start = 0
+        conversation_id = 0
         
-        for segment in segments:
-            current_group.append(segment)
+        for i, segment in enumerate(segments):
+            # Get the speaker first before any other operations
+            speaker = segment.get('speaker', 'UNKNOWN')
             
-            # Check if we should start a new group
-            if len(current_group) >= self.segments_per_group:
-                # Check if there's a significant pause that might indicate a scene break
-                if len(current_group) > 1:
-                    pause_duration = current_group[-1]['start'] - current_group[-2]['end']
-                    if pause_duration > 2.0:  # More than 2 seconds of silence
-                        grouped.append(current_group[:-1])  # Add group without the last segment
-                        current_group = [current_group[-1]]  # Start new group with last segment
-                        continue
+            if current_group:
+                current_duration = segment['end'] - segments[current_conversation_start]['start']
+                gap_to_previous = segment['start'] - current_group[-1]['end']
                 
-                grouped.append(current_group)
-                current_group = []
-        
-        # Add any remaining segments
-        if current_group:
-            grouped.append(current_group)
+                # Conditions for starting a new group:
+                # 1. Current group would exceed max duration
+                # 2. Long pause between speakers
+                # 3. Too many different speakers
+                # 4. Natural conversation boundary (long pause + speaker change)
+                should_start_new = (
+                    current_duration > self.max_segment_duration or
+                    gap_to_previous > self.max_silence_between_speakers or
+                    (len(current_speakers) >= 3 and speaker not in current_speakers) or
+                    (gap_to_previous > 1.0 and speaker not in current_speakers)
+                )
+                
+                if should_start_new:
+                    # Only save group if it meets criteria
+                    group_duration = current_group[-1]['end'] - current_group[0]['start']
+                    speaker_turns = sum(1 for j in range(1, len(current_group)) 
+                                     if current_group[j].get('speaker') != current_group[j-1].get('speaker'))
+                    
+                    if (group_duration >= self.min_segment_duration and 
+                        speaker_turns >= self.min_speaker_turns):
+                        # Assign conversation ID to all segments in group
+                        for seg in current_group:
+                            seg['conversation_id'] = f"conv_{conversation_id}"
+                        grouped.append(current_group)
+                        conversation_id += 1
+                    
+                    current_group = []
+                    current_speakers = set()
+                    current_conversation_start = i
             
+            current_group.append(segment)
+            current_speakers.add(speaker)
+        
+        # Handle final group
+        if current_group:
+            group_duration = current_group[-1]['end'] - current_group[0]['start']
+            speaker_turns = sum(1 for j in range(1, len(current_group)) 
+                             if current_group[j].get('speaker') != current_group[j-1].get('speaker'))
+            
+            if (group_duration >= self.min_segment_duration and 
+                speaker_turns >= self.min_speaker_turns):
+                # Assign conversation ID to all segments in final group
+                for seg in current_group:
+                    seg['conversation_id'] = f"conv_{conversation_id}"
+                grouped.append(current_group)
+        
+        self.logger.debug(
+            f"Grouped {len(segments)} segments into {len(grouped)} conversation groups. "
+            f"Average group size: {sum(len(g) for g in grouped)/len(grouped) if grouped else 0:.1f} segments"
+        )
+        
         return grouped
 
     def _analyze_text(self, text: str) -> Dict[str, Any]:
@@ -243,24 +308,28 @@ class SentimentAnalysis:
         current_sentiment: str
     ) -> float:
         """
-        Calculate a context score based on surrounding segments.
-        Higher score if surrounding segments have similar sentiment.
+        Calculate a context score based on surrounding segments and speaker interactions
+        Higher score if surrounding segments show engaging conversation
         """
         context_score = 1.0
         window = self.context_window
         
-        # Look at previous segments
-        for i in range(max(0, current_idx - window), current_idx):
-            prev_text = " ".join([seg['text'] for seg in grouped_segments[i]])
-            prev_sentiment = self._analyze_text(prev_text)
-            if prev_sentiment['label'] == current_sentiment:
-                context_score += 0.1  # Boost score for matching sentiment
-        
-        # Look at following segments
-        for i in range(current_idx + 1, min(current_idx + window + 1, len(grouped_segments))):
-            next_text = " ".join([seg['text'] for seg in grouped_segments[i]])
-            next_sentiment = self._analyze_text(next_text)
-            if next_sentiment['label'] == current_sentiment:
-                context_score += 0.1  # Boost score for matching sentiment
+        # Look at surrounding segments
+        for i in range(max(0, current_idx - window), min(current_idx + window + 1, len(grouped_segments))):
+            if i == current_idx:
+                continue
+                
+            group = grouped_segments[i]
+            speakers = set(seg.get('speaker', 'UNKNOWN') for seg in group)
+            
+            # Higher score for multi-speaker segments (active conversation)
+            if len(speakers) > 1:
+                context_score += 0.15
+            
+            # Check sentiment continuity
+            group_text = " ".join([seg['text'] for seg in group])
+            group_sentiment = self._analyze_text(group_text)
+            if group_sentiment['label'] == current_sentiment:
+                context_score += 0.1
         
         return context_score

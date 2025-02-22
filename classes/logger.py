@@ -1,5 +1,4 @@
 import logging
-from concurrent_log_handler import ConcurrentRotatingFileHandler
 
 class Logger:
     def __init__(self, app):
@@ -11,11 +10,11 @@ class Logger:
         with open('app.log', 'w'):
             pass
 
-        self.handler = ConcurrentRotatingFileHandler(
+        # Use standard FileHandler instead of ConcurrentRotatingFileHandler
+        self.handler = logging.FileHandler(
             'app.log',
-            maxBytes=10240,
-            backupCount=1,
-            use_gzip=False
+            mode='a',
+            encoding='utf-8'
         )
         # Include level name in format for better debugging
         self.formatter = logging.Formatter('%(levelname)s - %(message)s')

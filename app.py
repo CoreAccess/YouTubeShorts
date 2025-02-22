@@ -9,15 +9,19 @@ from classes.main_pipeline import MainPipeline
 from werkzeug.utils import secure_filename
 import werkzeug
 
+# Configure logging levels for all potentially verbose libraries
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('moviepy').setLevel(logging.WARNING)
+logging.getLogger('ffmpeg').setLevel(logging.ERROR)
+
 app = Flask(__name__)
 app.config.from_object(Config)
 
 # Initialize our own apps logger
 logger = Logger(app).get_logger()
-
-# Suppress HTTP request logs
-werkzeug_logger = logging.getLogger('werkzeug')
-werkzeug_logger.setLevel(logging.WARNING)
 
 # Ensure uploads directory exists
 UPLOAD_FOLDER = 'uploads'

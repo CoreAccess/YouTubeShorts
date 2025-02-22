@@ -1,25 +1,27 @@
 from typing import List, Optional, Dict, Any, Generator
 import logging
 import os
-import json
 from dataclasses import dataclass
 from classes.audio.audio_analyzer import AudioAnalyzer
 from classes.video.segment_extractor import SegmentExtractor, Segment
 from classes.audio.transcript import Transcript
+from classes.audio.speaker_diarizer import SpeakerDiarizer
+from classes.audio.transcript_merger import merge_transcript_and_diarization
 from classes.nlp.sentiment_analysis import SentimentAnalysis
 from classes.util.segment_selector import SegmentSelector
 from classes.audio.audio_feature_analyzer import AudioFeatureAnalyzer
 from classes.util.progress_tracker import ProgressTracker, ProcessingStage, ProgressUpdate
+import json
 
 @dataclass
 class ProcessingResult:
     success: bool
     message: str
-    segments: List[Segment]  # Fixed List type annotation
+    segments: List[Segment]
     artifacts: Dict[str, str]
     progress: Dict[str, Any]
 
-class MainPipeline:
+class MainPipeline: 
     """
     Orchestrates the processing pipeline and manages artifacts for video analysis.
     Coordinates between different components (audio, transcription, sentiment, etc.)
@@ -38,6 +40,7 @@ class MainPipeline:
         # Initialize components
         self.progress_tracker = ProgressTracker()
         self.transcript_engine = Transcript(self.progress_tracker)
+        self.speaker_diarizer = SpeakerDiarizer(self.progress_tracker)
         self.sentiment_analyzer = SentimentAnalysis(self.progress_tracker)
         self.segment_extractor = SegmentExtractor(self.progress_tracker)
         self.segment_selector = SegmentSelector(self.progress_tracker)
@@ -84,8 +87,9 @@ class MainPipeline:
                     progress=self.progress_tracker.to_dict()
                 )
                 return
-
+            
             artifacts['audio'] = audio_path
+            
             self.progress_tracker.update_progress(
                 ProcessingStage.AUDIO_EXTRACTION, 
                 1.0, 
@@ -109,6 +113,28 @@ class MainPipeline:
 
             artifacts['transcript'] = transcript_path
             
+            # Check if speaker information already exists in the transcript
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                transcript_data = json.load(f)
+            
+            has_speaker_info = any('speaker' in segment for segment in transcript_data.get('segments', []))
+            
+            # Only run speaker diarization if needed
+            if not has_speaker_info:
+                self.logger.info("No speaker information found. Running speaker diarization...")
+                # Process speaker diarization
+                diarization_data = self.speaker_diarizer.process_audio(audio_path)
+                
+                # Merge transcript with diarization results
+                merged_transcript = merge_transcript_and_diarization(transcript_data, diarization_data)
+                
+                # Save merged transcript
+                with open(transcript_path, 'w', encoding='utf-8') as f:
+                    json.dump(merged_transcript, f, indent=2, ensure_ascii=False)
+            else:
+                self.logger.info("Using existing speaker information from transcript")
+                merged_transcript = transcript_data
+
             # 3. Analyze sentiment
             sentiment_path = self.sentiment_analyzer.analyze_transcript(transcript_path, self.temp_dir)
             if self.progress_callback:
@@ -125,7 +151,7 @@ class MainPipeline:
                 return
 
             artifacts['sentiment'] = sentiment_path
-            
+
             # 4. Analyze audio features
             self.progress_tracker.update_progress(
                 ProcessingStage.AUDIO_FEATURE_ANALYSIS,
