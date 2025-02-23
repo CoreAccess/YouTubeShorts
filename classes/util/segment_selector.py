@@ -39,19 +39,20 @@ class SegmentSelector:
             'neutral': 0.85  # Increased to allow more neutral segments if they're engaging
         }
         
-        # Adjusted weights to be more lenient with conversation quality
+        # Adjusted weights to favor longer conversations
         self.weights = {
-            'sentiment': 0.25,    # Reduced to be less strict on emotional content
-            'audio': 0.3,        # Maintained for audio quality
-            'context': 0.25,     # Increased for more context consideration
-            'conversation': 0.2   # Maintained for speaker interaction
+            'sentiment': 0.25,    
+            'audio': 0.3,        
+            'context': 0.2,      # Slightly reduced to give more weight to duration
+            'conversation': 0.25  # Increased to favor good conversations
         }
         
-        # Duration parameters maintaining minimum requirement
-        self.min_duration = 30.0  # Maintain strict minimum of 30 seconds
-        self.max_duration = 90.0  # Maintained maximum
-        self.ideal_duration = 60.0  # Maintained ideal
-        self.duration_flexibility = 0.25  # Slightly reduced for more precise targeting
+        # Duration parameters optimized for longer segments
+        self.min_duration = 30.0  # Maintain minimum
+        self.max_duration = 90.0  # Keep maximum
+        self.ideal_duration = 60.0  # Target duration
+        self.duration_tolerance = 15.0  # How far from ideal before heavy penalties
+        self.duration_flexibility = 0.2  # Stricter adherence to duration preferences
 
     def select_interesting_segments(
         self, 
@@ -393,33 +394,55 @@ class SegmentSelector:
         return weighted_sum / total_weight if total_weight > 0 else 0.5
 
     def has_significant_overlap(self, start: float, end: float, used_ranges: List[Tuple[float, float]]) -> bool:
-        """Enhanced overlap detection with speaker transition awareness"""
+        """
+        Enhanced overlap detection focusing on natural conversation patterns and speaker transitions.
+        """
         for used_start, used_end in used_ranges:
             overlap_start = max(start, used_start)
             overlap_end = min(end, used_end)
             
             if overlap_end > overlap_start:
                 overlap_duration = overlap_end - overlap_start
-                segment_duration = end - start
+                total_duration = end - start
                 
-                # More strict overlap ratio for longer segments
-                max_overlap_ratio = 0.12 if segment_duration > 45.0 else 0.15
+                # Analyze speech patterns in the overlap
+                overlap_features = [
+                    f for f in self.audio_features
+                    if f.start <= overlap_end and f.end >= overlap_start
+                ]
                 
-                if (overlap_duration > 4.0 and  # Increased minimum overlap duration
-                    (overlap_duration / segment_duration) > max_overlap_ratio):
+                if not overlap_features:
+                    continue
+                
+                # Track speaker transitions and speech continuity
+                speakers = set()
+                continuous_speech = 0
+                prev_end = None
+                
+                for feat in sorted(overlap_features, key=lambda x: x.start):
+                    if hasattr(feat, 'speaker_id'):
+                        speakers.add(feat.speaker_id)
                     
-                    # Check for speaker transitions in overlap
-                    speakers_in_overlap = set()
-                    for feat in self.audio_features:
-                        if feat.start >= overlap_start and feat.end <= overlap_end:
-                            if hasattr(feat, 'speaker_id'):
-                                speakers_in_overlap.add(feat.speaker_id)
-                    
-                    # If multiple speakers in overlap, more likely to be same conversation
-                    if len(speakers_in_overlap) >= 2:
-                        return True
-                        
+                    # Check speech continuity
+                    if prev_end is not None:
+                        gap = feat.start - prev_end
+                        if gap < 0.5:  # Small gaps indicate continuous conversation
+                            continuous_speech += 1
+                    prev_end = feat.end
+                
+                # Decision logic for overlap significance
+                is_significant = (
+                    # Long overlap with continuous speech
+                    (overlap_duration > 4.0 and continuous_speech >= 2) or
+                    # Multiple speakers actively conversing
+                    (len(speakers) >= 2 and overlap_duration > 3.0) or
+                    # Substantial portion of the segment overlaps
+                    (overlap_duration / total_duration > 0.25)
+                )
+                
+                if is_significant:
                     return True
+                    
         return False
 
     def _select_best_segments(
@@ -442,57 +465,56 @@ class SegmentSelector:
         
         for segment in scored_segments:
             # Calculate conversation metrics with enhanced gap detection
-            avg_conversation_likelihood = sum(
-                f.conversation_likelihood 
-                for f in self.audio_features 
+            relevant_features = [
+                f for f in self.audio_features 
                 if f.start >= segment.start and f.end <= segment.end
-            ) / sum(
-                1 for f in self.audio_features 
-                if f.start >= segment.start and f.end <= segment.end
-            )
+            ]
             
-            # Enhanced score threshold with conversation quality consideration
-            if (segment.combined_score < min_score and 
-                avg_conversation_likelihood < 0.3):
+            if not relevant_features:
                 continue
                 
-            # Improved conversation boundary detection
+            # Analyze conversation continuity
+            duration = segment.end - segment.start
+            avg_conversation_likelihood = sum(
+                f.conversation_likelihood for f in relevant_features
+            ) / len(relevant_features)
+            
+            # Boost scores for longer, coherent conversations
+            duration_factor = min(1.0, (duration - 30) / 30)  # Scales up to 60s
+            if duration >= 45.0 and avg_conversation_likelihood > 0.4:
+                segment.combined_score *= (1.0 + duration_factor * 0.3)
+            
+            # Enhanced score threshold considering duration
+            min_score_adjusted = min_score * (0.9 if duration >= 50.0 else 1.0)
+            if (segment.combined_score < min_score_adjusted and 
+                avg_conversation_likelihood < 0.35):
+                continue
+                
+            # Check for natural conversation flow with previous segments
             has_overlap = False
             for conv_start, conv_end in conversation_ranges:
-                overlap_start = max(segment.start, conv_start)
-                overlap_end = min(segment.end, conv_end)
-                
-                if overlap_end > overlap_start:
-                    overlap_duration = overlap_end - overlap_start
-                    segment_duration = segment.end - segment.start
-                    
-                    # More strict overlap handling for longer segments
-                    max_overlap = 4.0 if segment_duration > 45.0 else 3.5
-                    if (overlap_duration > max_overlap and 
-                        (overlap_duration / segment_duration) > 0.12):  # Reduced overlap ratio
-                        has_overlap = True
-                        break
+                if self.has_significant_overlap(segment.start, segment.end, [(conv_start, conv_end)]):
+                    has_overlap = True
+                    break
             
             if has_overlap:
                 continue
                 
-            # Enhanced silence analysis
+            # Analyze speech patterns
             silence_info = self._analyze_silence_patterns(segment.start, segment.end)
             if silence_info['long_silence_ratio'] > max_silence_ratio and silence_info['natural_pause_ratio'] < 0.2:
                 continue
                 
-            # Boost scores based on conversation quality
-            if avg_conversation_likelihood > 0.45:
-                segment.combined_score *= 1.3
-            elif avg_conversation_likelihood > 0.3:
-                segment.combined_score *= 1.15
-                
             filtered_segments.append(segment)
-            # Add to conversation ranges with tighter spacing
-            conversation_ranges.append((segment.start - 1.0, segment.end + 1.0))
+            # Add to conversation ranges with adaptive spacing
+            buffer = 1.0 if duration < 45.0 else 1.5  # Larger buffer for longer segments
+            conversation_ranges.append((segment.start - buffer, segment.end + buffer))
         
-        # Sort by enhanced score
-        filtered_segments.sort(key=lambda x: x.combined_score, reverse=True)
+        # Sort by score and duration preference
+        filtered_segments.sort(
+            key=lambda x: (x.combined_score * (1.0 + min(0.3, (x.end - x.start - 30) / 100))),
+            reverse=True
+        )
         
         # Final selection with improved spacing
         selected = []
@@ -505,7 +527,7 @@ class SegmentSelector:
             ):
                 continue
             
-            # More strict variety check for consecutive segments
+            # Variety check with duration consideration
             if len(selected) >= 3:
                 similar_segments = sum(
                     1 for s in selected[-3:]
@@ -605,7 +627,8 @@ class SegmentSelector:
         sentiment_start: float
     ) -> Tuple[float, float]:
         """
-        Find optimal sentence boundaries that respect word boundaries and speech patterns
+        Find conversation boundaries with more natural speech pattern detection.
+        Allows conversations to start mid-sentence for more natural segments.
         """
         # Find starting segment
         start_segment_idx = 0
@@ -614,71 +637,73 @@ class SegmentSelector:
                 start_segment_idx = idx
                 break
         
-        # Look back for a clean sentence start
-        look_back_limit = 5  # Maximum segments to look back
+        # Instead of looking back for sentence boundaries, analyze conversation flow
         searches_back = 0
-        while start_segment_idx > 0 and searches_back < look_back_limit:
-            curr_text = transcript_segments[start_segment_idx]['text'].strip()
-            prev_text = transcript_segments[start_segment_idx - 1]['text'].strip()
+        while start_segment_idx > 0 and searches_back < 5:  # Keep 5 segment look-back limit
+            prev_segment = transcript_segments[start_segment_idx - 1]
+            curr_segment = transcript_segments[start_segment_idx]
             
-            # Good sentence break conditions
-            good_break = (
-                prev_text.endswith(('.', '!', '?')) and
-                (not curr_text or curr_text[0].isupper())
-            )
+            # Check for natural conversation breaks (pauses, speaker changes, topic shifts)
+            time_gap = curr_segment['start'] - prev_segment['end']
+            speaker_change = curr_segment.get('speaker') != prev_segment.get('speaker')
             
-            if good_break:
-                # Add small buffer if previous segment is short
-                if transcript_segments[start_segment_idx]['start'] - transcript_segments[start_segment_idx - 1]['start'] < 1.0:
-                    start_segment_idx -= 1
+            # Allow starting at any word if there's a natural break in conversation
+            if time_gap > 0.75 or speaker_change:  # Reduced from 1.0s gap
                 break
             
-            start_segment_idx -= 1
+            # If there's strong conversation continuity, include previous segment
+            if time_gap < 0.3:  # Quick speech indicates conversation flow
+                start_segment_idx -= 1
+            
             searches_back += 1
         
         segment_start = transcript_segments[start_segment_idx]['start']
         
-        # Find end segment - target 60s but allow flexibility
+        # Find end segment - target ~60s with natural conversation end
         target_end_time = segment_start + 60.0
         end_segment_idx = start_segment_idx
+        prev_speaker = transcript_segments[end_segment_idx].get('speaker')
         
         while end_segment_idx < len(transcript_segments) - 1:
             curr_duration = transcript_segments[end_segment_idx]['end'] - segment_start
             next_duration = transcript_segments[end_segment_idx + 1]['end'] - segment_start
+            curr_segment = transcript_segments[end_segment_idx]
+            next_segment = transcript_segments[end_segment_idx + 1]
             
-            # Stop if adding next segment would exceed max duration
+            # Stop if next segment would make it too long
             if next_duration > 90.0:
                 break
             
-            # Check if current segment is a good ending point
-            curr_text = transcript_segments[end_segment_idx]['text'].strip()
-            next_text = transcript_segments[end_segment_idx + 1]['text'].strip()
+            # Look for natural conversation endpoints
+            time_gap = next_segment['start'] - curr_segment['end']
+            speaker_change = next_segment.get('speaker') != curr_segment.get('speaker')
             
-            good_end_point = (
-                curr_text.endswith(('.', '!', '?')) and
-                (not next_text or next_text[0].isupper())
-            )
-            
-            # If we have a good end point and reasonable duration, consider stopping
-            if good_end_point and curr_duration >= 45.0:
-                # If we're close to target duration or next segment would be too long, stop here
-                if abs(curr_duration - 60.0) <= 15.0 or next_duration > 75.0:
-                    break
+            # Consider ending if we're in target duration range and hit a natural break
+            if curr_duration >= 45.0:
+                if time_gap > 0.75 or speaker_change:  # Natural conversation break
+                    # Strong preference for ending near target duration
+                    if abs(curr_duration - 60.0) <= 20.0:
+                        break
+                    # Or if adding next segment would make it too far from target
+                    if abs(next_duration - 60.0) > 25.0:
+                        break
             
             end_segment_idx += 1
+            prev_speaker = curr_segment.get('speaker')
         
         segment_end = transcript_segments[end_segment_idx]['end']
         
-        # Add small buffer at the end to avoid cutting off words
+        # Small adjustment for word completion
         if end_segment_idx < len(transcript_segments) - 1:
-            next_start = transcript_segments[end_segment_idx + 1]['start']
-            next_end = transcript_segments[end_segment_idx + 1]['end']
+            next_segment = transcript_segments[end_segment_idx + 1]
             
-            # If there's a small gap and including it wouldn't make segment too long
-            if next_start - segment_end <= 0.3 and next_end - segment_start <= 90.0:
-                segment_end = next_end
+            # Include next segment if it's very close and maintains conversation flow
+            if (next_segment['start'] - segment_end <= 0.3 and 
+                next_segment['end'] - segment_start <= 90.0 and
+                next_segment.get('speaker') == prev_speaker):
+                segment_end = next_segment['end']
         
-        # Verify final duration is within bounds
+        # Verify duration
         duration = segment_end - segment_start
         if 30.0 <= duration <= 90.0:
             return (segment_start, segment_end)
