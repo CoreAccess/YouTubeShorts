@@ -96,63 +96,7 @@ class MainPipeline:
                 "Audio extraction complete"
             )
             
-            # 2. Generate transcript
-            transcript_path = self.transcript_engine.transcribe(audio_path, self.temp_dir)
-            if self.progress_callback:
-                yield self.progress_callback(self.progress_tracker.get_last_update())
-
-            if not transcript_path:
-                self._last_result = ProcessingResult(
-                    success=False,
-                    message="Failed to generate transcript",
-                    segments=[],
-                    artifacts=artifacts,
-                    progress=self.progress_tracker.to_dict()
-                )
-                return
-
-            artifacts['transcript'] = transcript_path
-            
-            # Check if speaker information already exists in the transcript
-            with open(transcript_path, 'r', encoding='utf-8') as f:
-                transcript_data = json.load(f)
-            
-            has_speaker_info = any('speaker' in segment for segment in transcript_data.get('segments', []))
-            
-            # Only run speaker diarization if needed
-            if not has_speaker_info:
-                self.logger.info("No speaker information found. Running speaker diarization...")
-                # Process speaker diarization
-                diarization_data = self.speaker_diarizer.process_audio(audio_path)
-                
-                # Merge transcript with diarization results
-                merged_transcript = merge_transcript_and_diarization(transcript_data, diarization_data)
-                
-                # Save merged transcript
-                with open(transcript_path, 'w', encoding='utf-8') as f:
-                    json.dump(merged_transcript, f, indent=2, ensure_ascii=False)
-            else:
-                self.logger.info("Using existing speaker information from transcript")
-                merged_transcript = transcript_data
-
-            # 3. Analyze sentiment
-            sentiment_path = self.sentiment_analyzer.analyze_transcript(transcript_path, self.temp_dir)
-            if self.progress_callback:
-                yield self.progress_callback(self.progress_tracker.get_last_update())
-
-            if not sentiment_path:
-                self._last_result = ProcessingResult(
-                    success=False,
-                    message="Failed to analyze sentiment",
-                    segments=[],
-                    artifacts=artifacts,
-                    progress=self.progress_tracker.to_dict()
-                )
-                return
-
-            artifacts['sentiment'] = sentiment_path
-
-            # 4. Analyze audio features
+            # 2. Analyze audio features first
             self.progress_tracker.update_progress(
                 ProcessingStage.AUDIO_FEATURE_ANALYSIS,
                 0.0,
@@ -174,13 +118,73 @@ class MainPipeline:
                 )
                 return
 
+            # 3. Generate transcript
+            transcript_path = self.transcript_engine.transcribe(audio_path, self.temp_dir)
+            if self.progress_callback:
+                yield self.progress_callback(self.progress_tracker.get_last_update())
+
+            if not transcript_path:
+                self._last_result = ProcessingResult(
+                    success=False,
+                    message="Failed to generate transcript",
+                    segments=[],
+                    artifacts=artifacts,
+                    progress=self.progress_tracker.to_dict()
+                )
+                return
+
+            artifacts['transcript'] = transcript_path
+            
+            # Check if speaker information already exists in the transcript
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                transcript_data = json.load(f)
+            
+            # 4. Run speaker diarization and merge with audio features
+            has_speaker_info = any('speaker' in segment for segment in transcript_data.get('segments', []))
+            
+            # Only run speaker diarization if needed
+            if not has_speaker_info:
+                self.logger.info("No speaker information found. Running speaker diarization...")
+                diarization_data = self.speaker_diarizer.process_audio(audio_path)
+                
+                # Merge transcript with diarization results and audio features
+                merged_transcript = merge_transcript_and_diarization(
+                    transcript_data, 
+                    diarization_data,
+                    audio_features
+                )
+                
+                # Save merged transcript
+                with open(transcript_path, 'w', encoding='utf-8') as f:
+                    json.dump(merged_transcript, f, indent=2, ensure_ascii=False)
+            else:
+                self.logger.info("Using existing speaker information from transcript")
+                merged_transcript = transcript_data
+
+            # 5. Analyze sentiment
+            sentiment_path = self.sentiment_analyzer.analyze_transcript(transcript_path, self.temp_dir)
+            if self.progress_callback:
+                yield self.progress_callback(self.progress_tracker.get_last_update())
+
+            if not sentiment_path:
+                self._last_result = ProcessingResult(
+                    success=False,
+                    message="Failed to analyze sentiment",
+                    segments=[],
+                    artifacts=artifacts,
+                    progress=self.progress_tracker.to_dict()
+                )
+                return
+
+            artifacts['sentiment'] = sentiment_path
+
             self.progress_tracker.update_progress(
                 ProcessingStage.SEGMENT_SELECTION,
                 0.0,
                 "Starting segment selection"
             )
             
-            # 5. Select segments using combined features
+            # 6. Select segments using combined features
             selected_segments = self.segment_selector.select_interesting_segments(
                 transcript_path, 
                 sentiment_path,
@@ -201,7 +205,7 @@ class MainPipeline:
                 f"Selected {len(segments)} segments"
             )
             
-            # 6. Extract video segments
+            # 7. Extract video segments
             if segments:
                 extracted_segments = self.segment_extractor.extract_video_segments(
                     video_path, segments, self.segments_dir

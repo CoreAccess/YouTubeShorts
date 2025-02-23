@@ -189,75 +189,96 @@ class SentimentAnalysis:
 
     def _group_segments(self, segments: List[Dict]) -> List[List[Dict]]:
         """
-        Group segments into conversations based on speaker changes and timing.
-        Ensures proper conversation boundaries and maintains speaker coherence.
+        Enhanced grouping with more lenient requirements for conversations
         """
-        grouped = []
-        current_group = []
-        current_speakers = set()
-        current_conversation_start = 0
-        conversation_id = 0
+        # Group by existing conversation IDs first
+        conversation_groups = {}
+        used_time_ranges = []
         
-        for i, segment in enumerate(segments):
-            # Get the speaker first before any other operations
-            speaker = segment.get('speaker', 'UNKNOWN')
-            
-            if current_group:
-                current_duration = segment['end'] - segments[current_conversation_start]['start']
-                gap_to_previous = segment['start'] - current_group[-1]['end']
-                
-                # Conditions for starting a new group:
-                # 1. Current group would exceed max duration
-                # 2. Long pause between speakers
-                # 3. Too many different speakers
-                # 4. Natural conversation boundary (long pause + speaker change)
-                should_start_new = (
-                    current_duration > self.max_segment_duration or
-                    gap_to_previous > self.max_silence_between_speakers or
-                    (len(current_speakers) >= 3 and speaker not in current_speakers) or
-                    (gap_to_previous > 1.0 and speaker not in current_speakers)
-                )
-                
-                if should_start_new:
-                    # Only save group if it meets criteria
-                    group_duration = current_group[-1]['end'] - current_group[0]['start']
-                    speaker_turns = sum(1 for j in range(1, len(current_group)) 
-                                     if current_group[j].get('speaker') != current_group[j-1].get('speaker'))
+        for segment in segments:
+            conv_id = segment.get('conversation_id')
+            if conv_id:
+                if conv_id not in conversation_groups:
+                    # More lenient overlap check
+                    has_overlap = False
+                    for start, end in used_time_ranges:
+                        overlap_start = max(segment['start'], start)
+                        overlap_end = min(segment['end'], end)
+                        if overlap_end > overlap_start:
+                            overlap_duration = overlap_end - overlap_start
+                            if overlap_duration > 4.0:  # Increased from 3.5
+                                has_overlap = True
+                                break
                     
-                    if (group_duration >= self.min_segment_duration and 
-                        speaker_turns >= self.min_speaker_turns):
-                        # Assign conversation ID to all segments in group
-                        for seg in current_group:
-                            seg['conversation_id'] = f"conv_{conversation_id}"
-                        grouped.append(current_group)
-                        conversation_id += 1
+                    if not has_overlap:
+                        conversation_groups[conv_id] = []
+                        used_time_ranges.append((segment['start'], segment['end']))
+                        
+                if conv_id in conversation_groups:
+                    conversation_groups[conv_id].append(segment)
+        
+        # Sort groups by start time
+        grouped = [
+            group for group in conversation_groups.values()
+            if group
+        ]
+        grouped.sort(key=lambda g: g[0]['start'])
+        
+        # Validate and adjust groups with more lenient criteria
+        final_groups = []
+        last_end_time = 0
+        
+        for group in grouped:
+            duration = group[-1]['end'] - group[0]['start']
+            start_time = group[0]['start']
+            
+            # More lenient gap requirement
+            if start_time - last_end_time < 2.0:  # Reduced from 2.5
+                continue
+            
+            # Duration bounds with strict minimum
+            if not (30.0 <= duration <= 95.0):  # Maintain 30s minimum, allow up to 95s max
+                continue
+            
+            # Split long groups at natural break points
+            if duration > 80.0:  # Increased from 75.0
+                subgroups = []
+                current_subgroup = []
+                current_duration = 0
+                
+                for segment in group:
+                    seg_duration = segment['end'] - segment['start']
+                    new_duration = current_duration + seg_duration
                     
-                    current_group = []
-                    current_speakers = set()
-                    current_conversation_start = i
+                    # More lenient splitting conditions but maintain 30s minimum
+                    if (new_duration > 95.0 or  # Increased from 90.0
+                        (current_duration >= 30.0 and  # Maintain 30s minimum
+                         segment['text'].strip().endswith(('.', '!', '?'))) or
+                        (subgroups and segment['start'] - subgroups[-1][-1]['end'] < 2.0)):  # Reduced from 2.5
+                        if current_subgroup:
+                            subgroups.append(current_subgroup)
+                        current_subgroup = [segment]
+                        current_duration = seg_duration
+                    else:
+                        current_subgroup.append(segment)
+                        current_duration = new_duration
+                
+                if current_subgroup:
+                    subgroups.append(current_subgroup)
+                
+                # Add subgroups with more lenient spacing but maintain duration requirements
+                for subgroup in subgroups:
+                    subgroup_duration = subgroup[-1]['end'] - subgroup[0]['start']
+                    if (30.0 <= subgroup_duration <= 95.0 and  # Maintain 30s minimum
+                        (not final_groups or subgroup[0]['start'] - final_groups[-1][-1]['end'] >= 2.0)):  # Reduced from 2.5
+                        final_groups.append(subgroup)
+            else:
+                final_groups.append(group)
             
-            current_group.append(segment)
-            current_speakers.add(speaker)
+            if final_groups:
+                last_end_time = final_groups[-1][-1]['end']
         
-        # Handle final group
-        if current_group:
-            group_duration = current_group[-1]['end'] - current_group[0]['start']
-            speaker_turns = sum(1 for j in range(1, len(current_group)) 
-                             if current_group[j].get('speaker') != current_group[j-1].get('speaker'))
-            
-            if (group_duration >= self.min_segment_duration and 
-                speaker_turns >= self.min_speaker_turns):
-                # Assign conversation ID to all segments in final group
-                for seg in current_group:
-                    seg['conversation_id'] = f"conv_{conversation_id}"
-                grouped.append(current_group)
-        
-        self.logger.debug(
-            f"Grouped {len(segments)} segments into {len(grouped)} conversation groups. "
-            f"Average group size: {sum(len(g) for g in grouped)/len(grouped) if grouped else 0:.1f} segments"
-        )
-        
-        return grouped
+        return final_groups
 
     def _analyze_text(self, text: str) -> Dict[str, Any]:
         """
@@ -308,8 +329,7 @@ class SentimentAnalysis:
         current_sentiment: str
     ) -> float:
         """
-        Calculate a context score based on surrounding segments and speaker interactions
-        Higher score if surrounding segments show engaging conversation
+        Enhanced context scoring with more lenient thresholds
         """
         context_score = 1.0
         window = self.context_window
@@ -322,14 +342,23 @@ class SentimentAnalysis:
             group = grouped_segments[i]
             speakers = set(seg.get('speaker', 'UNKNOWN') for seg in group)
             
-            # Higher score for multi-speaker segments (active conversation)
+            # More lenient scoring for conversations
             if len(speakers) > 1:
-                context_score += 0.15
+                context_score += 0.3  # Increased from 0.25
+            elif len(speakers) == 1 and any(seg.get('text', '').strip().endswith(('?', '!', '...')) for seg in group):
+                context_score += 0.2  # Increased from 0.15, added '...' as engaging marker
             
-            # Check sentiment continuity
+            # Analyze sentiment progression with more lenient scoring
             group_text = " ".join([seg['text'] for seg in group])
             group_sentiment = self._analyze_text(group_text)
-            if group_sentiment['label'] == current_sentiment:
-                context_score += 0.1
+            
+            # More generous bonuses for emotional variety
+            if group_sentiment['label'] != current_sentiment:
+                context_score += 0.25  # Increased from 0.2
+            
+            # More lenient bonus for emotional content
+            if group_sentiment['score'] > 0.6:  # Reduced from 0.7
+                context_score += 0.2  # Increased from 0.15
         
-        return context_score
+        # Allow higher boost for engaging contexts
+        return min(2.5, context_score)  # Increased from 2.2

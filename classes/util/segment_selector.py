@@ -28,34 +28,30 @@ class SegmentSelector:
         self.progress_tracker = progress_tracker
         self.audio_features = []
         
-        # More relaxed scoring weights
+        # Refined emotion weights with more lenient neutral handling
         self.interesting_emotions = {
             'fear': 1.2,
-            'joy': 1.1,
+            'joy': 1.15,
             'surprise': 1.2,
             'sadness': 1.1,
             'anger': 1.2,
             'disgust': 1.1,
-            'neutral': 0.9  # Increased from 0.8
+            'neutral': 0.85  # Increased to allow more neutral segments if they're engaging
         }
         
-        # More balanced weights to allow for variety
+        # Adjusted weights to be more lenient with conversation quality
         self.weights = {
-            'sentiment': 0.25,
-            'audio': 0.35,    # Increased audio weight
-            'context': 0.2,
-            'conversation': 0.2
+            'sentiment': 0.25,    # Reduced to be less strict on emotional content
+            'audio': 0.3,        # Maintained for audio quality
+            'context': 0.25,     # Increased for more context consideration
+            'conversation': 0.2   # Maintained for speaker interaction
         }
         
-        # More flexible duration parameters
-        self.min_duration = 40.0  # Reduced from 50.0
-        self.max_duration = 90.0  # Increased from 67.0
-        self.target_duration = 60.0
-        self.duration_tolerance = 20.0  # More flexible duration tolerance
-        
-        # Overlap prevention
-        self.max_overlap_duration = 0.0  # No overlap allowed
-        self.min_segment_gap = 1.0  # Minimum gap between segments
+        # Duration parameters maintaining minimum requirement
+        self.min_duration = 30.0  # Maintain strict minimum of 30 seconds
+        self.max_duration = 90.0  # Maintained maximum
+        self.ideal_duration = 60.0  # Maintained ideal
+        self.duration_flexibility = 0.25  # Slightly reduced for more precise targeting
 
     def select_interesting_segments(
         self, 
@@ -170,10 +166,14 @@ class SegmentSelector:
 
     def _calculate_duration_score(self, duration: float) -> float:
         """Calculate how well a segment matches our target duration."""
-        diff = abs(duration - self.target_duration)
-        if diff <= self.duration_tolerance:
-            return 1.0 - (diff / self.duration_tolerance)
-        return 0.0
+        # Stronger preference for segments closer to ideal duration
+        if duration < self.min_duration or duration > self.max_duration:
+            return 0.0
+        
+        diff = abs(duration - self.ideal_duration)
+        if diff <= 15.0:  # Strong preference for 45-75 second range
+            return 1.0 - (diff / 15.0) * 0.5
+        return max(0.5, 1.0 - (diff / (self.max_duration - self.ideal_duration)))
 
     def _calculate_conversation_score(self, segments: List[SegmentScore]) -> float:
         """Calculate how engaging a conversation is based on speaker patterns."""
@@ -184,25 +184,34 @@ class SegmentSelector:
         speakers = set(s.speaker for s in segments if s.speaker != 'UNKNOWN')
         speaker_count = len(speakers)
         
-        # Calculate speaker turns
+        # Calculate speaker turns with enhanced pattern detection
         turns = 0
         prev_speaker = None
+        consecutive_same_speaker = 0
+        
         for seg in segments:
             if seg.speaker != prev_speaker and seg.speaker != 'UNKNOWN':
                 turns += 1
+                consecutive_same_speaker = 0
+            else:
+                consecutive_same_speaker += 1
             prev_speaker = seg.speaker
 
-        # Calculate turn density (turns per minute)
+        # Calculate turn density with penalties for long monologues
         duration = segments[-1].end - segments[0].start
         turn_density = (turns * 60) / duration if duration > 0 else 0
-
-        # Ideal turn density is about 4-8 turns per minute for engaging conversation
-        turn_score = min(1.0, turn_density / 6.0)
         
-        # Prefer 2-3 speakers
+        # Penalize segments with long monologues
+        monologue_penalty = 1.0 - (min(consecutive_same_speaker, 5) * 0.1)
+        
+        # Ideal turn density is about 4-8 turns per minute for engaging conversation
+        turn_score = min(1.0, turn_density / 6.0) * monologue_penalty
+        
+        # Prefer 2-3 speakers with stronger weight on speaker interaction
         speaker_score = min(1.0, speaker_count / 3.0)
-
-        return (turn_score * 0.6 + speaker_score * 0.4)
+        
+        # Weight turn patterns more heavily than speaker count
+        return (turn_score * 0.7 + speaker_score * 0.3)
 
     def _calculate_segment_scores(
         self,
@@ -210,141 +219,85 @@ class SegmentSelector:
         audio_features: List[Any],
         transcript_segments: List[Dict]
     ) -> List[SegmentScore]:
-        scores = []
-        
-        # First pass: identify major conversation clusters in the timeline
-        conversation_clusters = []
-        current_cluster = []
-        last_end = 0
-        
-        # Sort by start time to find temporal clusters
-        sorted_segments = sorted(sentiment_data, key=lambda x: x['start'])
-        
-        for segment in sorted_segments:
-            if not current_cluster:
-                current_cluster = [segment]
-            else:
-                gap = segment['start'] - last_end
-                # If gap is more than 30 seconds, consider it a new cluster
-                if gap > 30.0:
-                    conversation_clusters.append(current_cluster)
-                    current_cluster = [segment]
-                else:
-                    current_cluster.append(segment)
-            last_end = segment['end']
-        
-        if current_cluster:
-            conversation_clusters.append(current_cluster)
-            
-        # Calculate cluster importance scores
-        cluster_scores = []
-        for cluster in conversation_clusters:
-            cluster_duration = cluster[-1]['end'] - cluster[0]['start']
-            unique_speakers = len(set(s.get('speaker', 'UNKNOWN') for s in cluster))
-            speaker_turns = sum(1 for i in range(1, len(cluster))
-                              if cluster[i].get('speaker') != cluster[i-1].get('speaker'))
-            
-            # Score the cluster based on its properties
-            cluster_score = (
-                (unique_speakers / 3) * 0.4 +  # Weight for speaker variety
-                (min(speaker_turns / 10, 1.0) * 0.4) +  # Weight for interaction
-                (min(cluster_duration / 180, 1.0) * 0.2)  # Weight for sustained conversation
-            )
-            
-            cluster_scores.append((cluster_score, cluster))
-        
-        # Sort clusters by score
-        cluster_scores.sort(key=lambda x: x[0], reverse=True)
-        
-        # Process segments with preference for better clusters
-        for cluster_score, cluster in cluster_scores:
-            # Use existing conversation_id from sentiment data
-            conversation_groups = {}
-            for segment in cluster:
-                conv_id = segment.get('conversation_id')
-                if not conv_id:
-                    conv_id = f"single_{segment['start']}"
-                
+        # First, group by pre-detected conversations
+        conversation_groups = {}
+        for segment in sentiment_data:
+            conv_id = segment.get('conversation_id')
+            if conv_id:
                 if conv_id not in conversation_groups:
                     conversation_groups[conv_id] = []
                 conversation_groups[conv_id].append(segment)
+        
+        scores = []
+        for conv_id, segments in conversation_groups.items():
+            # Skip empty groups
+            if not segments:
+                continue
+                
+            # Sort segments by start time
+            segments.sort(key=lambda x: x['start'])
+            start = segments[0]['start']
+            end = segments[-1]['end']
+            duration = end - start
             
-            # Process each conversation group within the cluster
-            for conv_id, group_segments in conversation_groups.items():
-                # Sort segments by start time within the group
-                group_segments.sort(key=lambda x: x['start'])
+            # Skip conversations outside duration bounds
+            if duration < self.min_duration or duration > self.max_duration:
+                continue
                 
-                # Calculate group duration
-                duration = group_segments[-1]['end'] - group_segments[0]['start']
-                
-                # Skip if duration is outside our bounds
-                if not (self.min_duration <= duration <= self.max_duration):
+            # Calculate conversation quality metrics
+            speakers = set(s.get('speaker', 'UNKNOWN') for s in segments)
+            speaker_turns = sum(1 for i in range(1, len(segments))
+                              if segments[i].get('speaker') != segments[i-1].get('speaker'))
+            
+            # Conversation engagement score
+            conversation_score = (
+                min(len(speakers) / 3.0, 1.0) * 0.5 +  # Speaker variety
+                min(speaker_turns / 5.0, 1.0) * 0.5     # Interaction density
+            )
+            
+            # Audio engagement score
+            audio_score = self._get_audio_score(start, end, audio_features)
+            
+            # Calculate average sentiment and emotion intensity
+            sentiment_scores = []
+            for segment in segments:
+                if segment['sentiment'].lower() == 'neutral' and len(segments) > 1:
                     continue
-
-                # Get unique speakers in group
-                speakers = set(s.get('speaker', 'UNKNOWN') for s in group_segments)
-                speaker_count = len(speakers)
-                
-                # Calculate content variety score
-                variety_score = self._calculate_content_variety(group_segments)
-                
-                # Calculate group-level conversation quality
-                conversation_quality = self._calculate_conversation_score([
-                    SegmentScore(
-                        start=s['start'],
-                        end=s['end'],
-                        sentiment_score=0,
-                        audio_score=0,
-                        combined_score=0,
-                        sentiment_type=s['sentiment'],
-                        text=s['text'],
-                        speaker=s.get('speaker', 'UNKNOWN'),
-                        conversation_id=conv_id,
-                        speaker_count=speaker_count
-                    ) for s in group_segments
-                ])
-                
-                # Apply cluster quality boost
-                cluster_boost = cluster_score * 0.2  # Up to 20% boost for being in a good cluster
-                
-                # Process each segment in the conversation
-                for segment in group_segments:
-                    start = segment.get('start', 0)
-                    end = segment.get('end', 0)
                     
-                    # Basic feature scores
-                    audio_score = self._get_audio_score(start, end, audio_features)
-                    base_sentiment_score = segment['score']
-                    
-                    # Apply emotion weights
-                    emotion_multiplier = self.interesting_emotions.get(
-                        segment['sentiment'].lower(), 1.0
-                    )
-                    sentiment_score = base_sentiment_score * emotion_multiplier
-                    
-                    # Duration score for the entire conversation
-                    duration_score = self._calculate_duration_score(duration)
-                    
-                    # Combined score with conversation quality and cluster boost
-                    combined_score = (
-                        sentiment_score * self.weights['sentiment'] +
-                        audio_score * self.weights['audio'] +
-                        variety_score * self.weights['context'] +
-                        conversation_quality * self.weights['conversation']
-                    ) * duration_score * (1 + cluster_boost)
-
-                    scores.append(SegmentScore(
-                        start=start,
-                        end=end,
-                        sentiment_score=sentiment_score,
-                        audio_score=audio_score,
-                        combined_score=combined_score,
-                        sentiment_type=segment['sentiment'],
-                        text=segment['text'],
-                        speaker=segment.get('speaker', 'UNKNOWN'),
-                        conversation_id=conv_id,
-                        speaker_count=speaker_count
-                    ))
+                emotion_weight = self.interesting_emotions.get(
+                    segment['sentiment'].lower(), 1.0
+                )
+                weighted_score = segment['score'] * emotion_weight
+                sentiment_scores.append(weighted_score)
+            
+            if not sentiment_scores:  # Skip if all segments were neutral
+                continue
+            
+            avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+            
+            # Calculate final score with emphasis on conversation quality
+            combined_score = (
+                conversation_score * self.weights['conversation'] +
+                audio_score * self.weights['audio'] +
+                avg_sentiment * self.weights['sentiment']
+            )
+            
+            # Add duration preference
+            duration_preference = 1.0 - abs(60.0 - duration) / 30.0  # Prefer ~60s segments
+            combined_score *= max(0.8, duration_preference)  # Apply duration preference with minimum impact
+            
+            scores.append(SegmentScore(
+                start=start,
+                end=end,
+                sentiment_score=avg_sentiment,
+                audio_score=audio_score,
+                combined_score=combined_score,
+                sentiment_type=max(segments, key=lambda x: x['score'])['sentiment'],
+                text=" ".join(s['text'] for s in segments),
+                speaker="|".join(speakers),
+                conversation_id=conv_id,
+                speaker_count=len(speakers)
+            ))
         
         return scores
 
@@ -440,246 +393,172 @@ class SegmentSelector:
         return weighted_sum / total_weight if total_weight > 0 else 0.5
 
     def has_significant_overlap(self, start: float, end: float, used_ranges: List[Tuple[float, float]]) -> bool:
-        """Check if a segment has significant overlap with existing segments."""
-        segment_duration = end - start
-        
+        """Enhanced overlap detection with speaker transition awareness"""
         for used_start, used_end in used_ranges:
-            # Calculate overlap
             overlap_start = max(start, used_start)
             overlap_end = min(end, used_end)
+            
             if overlap_end > overlap_start:
                 overlap_duration = overlap_end - overlap_start
-                used_duration = used_end - used_start
-                overlap_ratio = overlap_duration / min(segment_duration, used_duration)
+                segment_duration = end - start
                 
-                if overlap_duration > self.max_overlap_duration:
-                    self.logger.debug(
-                        f"Segment {start:.1f}-{end:.1f} rejected: "
-                        f"overlap duration {overlap_duration:.1f}s exceeds max {self.max_overlap_duration}s"
-                    )
-                    return True
+                # More strict overlap ratio for longer segments
+                max_overlap_ratio = 0.12 if segment_duration > 45.0 else 0.15
                 
-                if overlap_ratio > 0.25:
-                    self.logger.debug(
-                        f"Segment {start:.1f}-{end:.1f} rejected: "
-                        f"overlap ratio {overlap_ratio:.1%} exceeds 25%"
-                    )
+                if (overlap_duration > 4.0 and  # Increased minimum overlap duration
+                    (overlap_duration / segment_duration) > max_overlap_ratio):
+                    
+                    # Check for speaker transitions in overlap
+                    speakers_in_overlap = set()
+                    for feat in self.audio_features:
+                        if feat.start >= overlap_start and feat.end <= overlap_end:
+                            if hasattr(feat, 'speaker_id'):
+                                speakers_in_overlap.add(feat.speaker_id)
+                    
+                    # If multiple speakers in overlap, more likely to be same conversation
+                    if len(speakers_in_overlap) >= 2:
+                        return True
+                        
                     return True
         return False
 
     def _select_best_segments(
         self,
         scored_segments: List[SegmentScore],
-        min_score: float = 0.3,
-        max_segments: int = 8,
-        target_duration: float = 60.0,
-        max_silence_ratio: float = 0.4
+        min_score: float = 0.25,
+        max_segments: int = None,
+        max_silence_ratio: float = 0.65
     ) -> List[SegmentScore]:
         if not scored_segments:
             return []
-
+            
         video_duration = max(seg.end for seg in scored_segments)
+        base_segments = 10
+        max_segments = max(5, min(20, int((video_duration / 800) * base_segments)))
         
-        # Calculate group scores first
-        group_scores = []
-        groups_by_id = {}
+        # Enhanced filtering with conversation pattern analysis
+        filtered_segments = []
+        conversation_ranges = []
         
-        # Group segments by conversation_id
         for segment in scored_segments:
-            if segment.conversation_id not in groups_by_id:
-                groups_by_id[segment.conversation_id] = []
-            groups_by_id[segment.conversation_id].append(segment)
-        
-        # Calculate scores for each group
-        for group_id, segments in groups_by_id.items():
-            segments.sort(key=lambda x: x.start)
-            start = segments[0].start
-            end = segments[-1].end
-            duration = end - start
-            
-            # Strictly enforce duration limits
-            if duration < self.min_duration or duration > self.max_duration:
-                self.logger.debug(
-                    f"Skipping segment {start:.1f}-{end:.1f} due to duration {duration:.1f}s "
-                    f"(min: {self.min_duration}s, max: {self.max_duration}s)"
-                )
-                continue
-                
-            # Calculate group level metrics
-            avg_score = sum(s.combined_score for s in segments) / len(segments)
-            speaker_variety = len(set(s.speaker for s in segments if s.speaker))
-            duration_score = self._calculate_duration_score(duration)
-            
-            # Combined group score
-            group_score = (
-                avg_score * 0.4 +
-                (speaker_variety / 3.0) * 0.3 +  # Normalize by expecting up to 3 speakers
-                duration_score * 0.3
+            # Calculate conversation metrics with enhanced gap detection
+            avg_conversation_likelihood = sum(
+                f.conversation_likelihood 
+                for f in self.audio_features 
+                if f.start >= segment.start and f.end <= segment.end
+            ) / sum(
+                1 for f in self.audio_features 
+                if f.start >= segment.start and f.end <= segment.end
             )
             
-            if group_score >= min_score:
-                group_scores.append((group_score, group_id, segments, start, end))
-        
-        # Sort groups by score
-        group_scores.sort(key=lambda x: x[0], reverse=True)
-
-        # Find natural breaks in conversation for zone boundaries
-        def find_natural_zone_boundaries() -> List[float]:
-            """Find natural breaking points in the video based on conversation flow."""
-            all_boundaries = set()
-            
-            # Add start and end of video
-            all_boundaries.add(0.0)
-            all_boundaries.add(video_duration)
-            
-            # Add points where conversations naturally break
-            current_conv = None
-            for segment in sorted(scored_segments, key=lambda x: x.start):
-                if segment.conversation_id != current_conv:
-                    all_boundaries.add(segment.start)
-                    if current_conv is not None:
-                        # Add end of previous conversation
-                        all_boundaries.add(prev_end)
-                    current_conv = segment.conversation_id
-                prev_end = segment.end
-            
-            # Ensure we have enough boundaries
-            boundaries = sorted(list(all_boundaries))
-            if len(boundaries) < max_segments * 2:
-                # Add evenly spaced points if needed
-                target_points = max_segments * 2
-                current_points = len(boundaries)
-                points_to_add = target_points - current_points
+            # Enhanced score threshold with conversation quality consideration
+            if (segment.combined_score < min_score and 
+                avg_conversation_likelihood < 0.3):
+                continue
                 
-                if points_to_add > 0:
-                    for i in range(1, points_to_add + 1):
-                        point = (i * video_duration) / (points_to_add + 1)
-                        boundaries.append(point)
-                    boundaries.sort()
+            # Improved conversation boundary detection
+            has_overlap = False
+            for conv_start, conv_end in conversation_ranges:
+                overlap_start = max(segment.start, conv_start)
+                overlap_end = min(segment.end, conv_end)
+                
+                if overlap_end > overlap_start:
+                    overlap_duration = overlap_end - overlap_start
+                    segment_duration = segment.end - segment.start
+                    
+                    # More strict overlap handling for longer segments
+                    max_overlap = 4.0 if segment_duration > 45.0 else 3.5
+                    if (overlap_duration > max_overlap and 
+                        (overlap_duration / segment_duration) > 0.12):  # Reduced overlap ratio
+                        has_overlap = True
+                        break
             
-            return boundaries
-
-        # Create zones based on natural boundaries
-        zone_boundaries = find_natural_zone_boundaries()
-        num_zones = len(zone_boundaries) - 1
-        zones_used = [False] * num_zones
+            if has_overlap:
+                continue
+                
+            # Enhanced silence analysis
+            silence_info = self._analyze_silence_patterns(segment.start, segment.end)
+            if silence_info['long_silence_ratio'] > max_silence_ratio and silence_info['natural_pause_ratio'] < 0.2:
+                continue
+                
+            # Boost scores based on conversation quality
+            if avg_conversation_likelihood > 0.45:
+                segment.combined_score *= 1.3
+            elif avg_conversation_likelihood > 0.3:
+                segment.combined_score *= 1.15
+                
+            filtered_segments.append(segment)
+            # Add to conversation ranges with tighter spacing
+            conversation_ranges.append((segment.start - 1.0, segment.end + 1.0))
         
-        def get_segment_zones(start: float, end: float) -> List[int]:
-            """Get which zones a segment spans"""
-            zones = []
-            for i in range(num_zones):
-                zone_start = zone_boundaries[i]
-                zone_end = zone_boundaries[i + 1]
-                # Check if segment overlaps with this zone
-                if start < zone_end and end > zone_start:
-                    zones.append(i)
-            return zones
-
-        def check_zone_availability(start: float, end: float, min_zones_between: int = 2) -> bool:
-            """Check if the zones for this segment are available and maintain spacing"""
-            segment_zones = get_segment_zones(start, end)
-            
-            # Check if any of these zones are already used
-            if any(zones_used[z] for z in segment_zones):
-                return False
-            
-            # Find closest used zones and enforce stricter spacing
-            used_zone_indices = [i for i, used in enumerate(zones_used) if used]
-            if used_zone_indices:
-                for zone in segment_zones:
-                    # Find distance to closest used zone
-                    distances = [abs(zone - used_zone) for used_zone in used_zone_indices]
-                    if min(distances) <= min_zones_between:
-                        return False
-            
-            return True
-
-        def check_for_overlap(start: float, end: float, used_ranges: List[Tuple[float, float]], buffer: float = 1.0) -> bool:
-            """Check if a segment overlaps with any existing segments, including a buffer zone"""
-            for used_start, used_end in used_ranges:
-                # Add buffer to both ends of segments when checking
-                if (start - buffer) < used_end and (end + buffer) > used_start:
-                    return True
-            return False
+        # Sort by enhanced score
+        filtered_segments.sort(key=lambda x: x.combined_score, reverse=True)
         
-        def mark_zones_used(start: float, end: float):
-            """Mark the zones this segment uses as taken"""
-            for zone in get_segment_zones(start, end):
-                zones_used[zone] = True
-
-        # Select segments ensuring no overlap and proper spacing
+        # Final selection with improved spacing
         selected = []
         used_ranges = []
         
-        for _, group_id, segments, start, end in group_scores:
-            duration = end - start
-            
-            # Double-check duration constraints
-            if duration < self.min_duration or duration > self.max_duration:
+        for segment in filtered_segments:
+            if any(
+                abs(segment.start - end) < 2.0 or abs(segment.end - start) < 2.0
+                for start, end in used_ranges
+            ):
                 continue
             
-            # Check for any overlap with existing selections, including buffer zones
-            if check_for_overlap(start, end, used_ranges):
-                self.logger.debug(
-                    f"Skipping segment {start:.1f}-{end:.1f} due to overlap with existing segments"
+            # More strict variety check for consecutive segments
+            if len(selected) >= 3:
+                similar_segments = sum(
+                    1 for s in selected[-3:]
+                    if abs(s.sentiment_score - segment.sentiment_score) < 0.3 and
+                    s.sentiment_type == segment.sentiment_type
                 )
-                continue
+                if similar_segments >= 3:
+                    continue
             
-            # Check zone availability and spacing
-            if not check_zone_availability(start, end):
-                self.logger.debug(
-                    f"Skipping segment {start:.1f}-{end:.1f} due to zone conflict"
-                )
-                continue
-            
-            selected.extend(segments)
-            used_ranges.append((start, end))
-            mark_zones_used(start, end)
-            
-            zone_indices = get_segment_zones(start, end)
-            self.logger.debug(
-                f"Selected segment {start:.1f}-{end:.1f} "
-                f"(duration: {duration:.1f}s, "
-                f"zones: {zone_indices}, "
-                f"speakers: {len(set(s.speaker for s in segments))})"
-            )
+            selected.append(segment)
+            used_ranges.append((segment.start, segment.end))
             
             if len(selected) >= max_segments:
                 break
-
-        if selected:
-            # Sort segments by start time
-            selected.sort(key=lambda x: x.start)
-            
-            # Validate final selection for overlaps and durations
-            final_selected = []
-            final_ranges = []
-            
-            for segment in selected:
-                duration = segment.end - segment.start
-                if self.min_duration <= duration <= self.max_duration:
-                    if not check_for_overlap(segment.start, segment.end, final_ranges):
-                        final_selected.append(segment)
-                        final_ranges.append((segment.start, segment.end))
-            
-            # Log final distribution info
-            used_zone_count = sum(1 for z in zones_used if z)
-            total_duration = sum(end - start for start, end in final_ranges)
-            
-            self.logger.info(
-                f"Selected {len(final_selected)} segments across {used_zone_count}/{num_zones} zones:\n"
-                f"Total content duration: {total_duration:.1f}s\n" +
-                "\n".join(
-                    f"Segment at {seg.start:.1f}-{seg.end:.1f} "
-                    f"(duration: {seg.end-seg.start:.1f}s, "
-                    f"zones: {get_segment_zones(seg.start, seg.end)})"
-                    for seg in final_selected
-                )
-            )
-            
-            return final_selected
         
-        return []
+        selected.sort(key=lambda x: x.start)
+        return selected
+
+    def _analyze_silence_patterns(self, start: float, end: float) -> Dict[str, float]:
+        """Analyze different types of silence in a segment"""
+        relevant_features = [
+            f for f in self.audio_features
+            if f.start >= start and f.end <= end
+        ]
+        
+        if not relevant_features:
+            return {
+                'total_silence_ratio': 0.5,
+                'long_silence_ratio': 0.5,
+                'natural_pause_ratio': 0.0
+            }
+        
+        # Count different types of silence
+        long_silences = 0
+        natural_pauses = 0
+        total_segments = len(relevant_features)
+        
+        consecutive_silence = 0
+        for feat in relevant_features:
+            if feat.silence_ratio > 0.8:
+                consecutive_silence += 1
+                if consecutive_silence >= 3:  # 1.5 seconds of silence
+                    long_silences += 1
+            else:
+                if 1 <= consecutive_silence <= 2:  # 0.5-1.0 second pause
+                    natural_pauses += 1
+                consecutive_silence = 0
+        
+        return {
+            'total_silence_ratio': sum(f.silence_ratio for f in relevant_features) / total_segments,
+            'long_silence_ratio': long_silences / total_segments,
+            'natural_pause_ratio': natural_pauses / total_segments
+        }
 
     def _calculate_boundary_score(self, segment: SegmentScore) -> float:
         """Calculate how well the segment aligns with sentence boundaries."""
@@ -726,120 +605,84 @@ class SegmentSelector:
         sentiment_start: float
     ) -> Tuple[float, float]:
         """
-        Find the natural sentence boundaries around a given sentiment start time.
-        Returns a tuple of (start, end) or None if invalid boundaries.
-        Tries to get as close to 60 seconds as possible while ending at a sentence boundary.
-        Will expand beyond the sentiment bounds to ensure we capture complete sentences.
+        Find optimal sentence boundaries that respect word boundaries and speech patterns
         """
-        # Find starting point (beginning of sentence)
+        # Find starting segment
         start_segment_idx = 0
         for idx, seg in enumerate(transcript_segments):
             if seg['start'] <= sentiment_start <= seg['end']:
                 start_segment_idx = idx
-                # Travel backwards until we find a clear sentence start
-                # Look for up to 5 segments back to find a good starting point
-                searches_back = 0
-                while start_segment_idx > 0 and searches_back < 5:
-                    prev_text = transcript_segments[start_segment_idx - 1]['text'].strip()
-                    curr_text = transcript_segments[start_segment_idx]['text'].strip()
-                    
-                    # Check if previous segment ends with sentence end
-                    if prev_text.endswith(('.', '!', '?')):
-                        # Add a small buffer by including part of the previous segment
-                        start_segment_idx -= 1
-                        break
-                    # Check if current segment starts with capital letter
-                    if not curr_text or curr_text[0].isupper():
-                        # Add a small buffer by including part of the previous segment if available
-                        if start_segment_idx > 0:
-                            # Look at previous segment duration
-                            prev_duration = transcript_segments[start_segment_idx]['start'] - transcript_segments[start_segment_idx - 1]['start']
-                            # If it's short enough (< 2s), include it for a smoother start
-                            if prev_duration <= 2.0:
-                                start_segment_idx -= 1
-                        break
-                    start_segment_idx -= 1
-                    searches_back += 1
                 break
         
-        # Get the actual start time, looking back slightly to avoid cutting off start
-        segment_start = transcript_segments[start_segment_idx]['start']
-        if start_segment_idx > 0:
-            prev_end = transcript_segments[start_segment_idx - 1]['end']
-            # If there's a small gap between segments, start a bit earlier
-            if segment_start - prev_end <= 0.5:  # If gap is less than 0.5 seconds
-                segment_start = prev_end
+        # Look back for a clean sentence start
+        look_back_limit = 5  # Maximum segments to look back
+        searches_back = 0
+        while start_segment_idx > 0 and searches_back < look_back_limit:
+            curr_text = transcript_segments[start_segment_idx]['text'].strip()
+            prev_text = transcript_segments[start_segment_idx - 1]['text'].strip()
+            
+            # Good sentence break conditions
+            good_break = (
+                prev_text.endswith(('.', '!', '?')) and
+                (not curr_text or curr_text[0].isupper())
+            )
+            
+            if good_break:
+                # Add small buffer if previous segment is short
+                if transcript_segments[start_segment_idx]['start'] - transcript_segments[start_segment_idx - 1]['start'] < 1.0:
+                    start_segment_idx -= 1
+                break
+            
+            start_segment_idx -= 1
+            searches_back += 1
         
-        # Find end point (try to get as close to 60 seconds as possible)
+        segment_start = transcript_segments[start_segment_idx]['start']
+        
+        # Find end segment - target 60s but allow flexibility
         target_end_time = segment_start + 60.0
         end_segment_idx = start_segment_idx
         
-        # First, find a segment that goes beyond our target time
         while end_segment_idx < len(transcript_segments) - 1:
-            if transcript_segments[end_segment_idx + 1]['start'] >= target_end_time:
-                break
-            end_segment_idx += 1
-
-        # Now work backwards until we find a complete sentence end
-        original_end_idx = end_segment_idx
-        while end_segment_idx > start_segment_idx:
-            curr_text = transcript_segments[end_segment_idx]['text'].strip()
-            next_text = transcript_segments[end_segment_idx + 1]['text'].strip() if end_segment_idx < len(transcript_segments) - 1 else ""
+            curr_duration = transcript_segments[end_segment_idx]['end'] - segment_start
+            next_duration = transcript_segments[end_segment_idx + 1]['end'] - segment_start
             
-            # Check if this is a good ending point
-            if curr_text.endswith(('.', '!', '?')):
-                # Also check if next segment starts a new sentence
-                if not next_text or next_text[0].isupper():
+            # Stop if adding next segment would exceed max duration
+            if next_duration > 90.0:
+                break
+            
+            # Check if current segment is a good ending point
+            curr_text = transcript_segments[end_segment_idx]['text'].strip()
+            next_text = transcript_segments[end_segment_idx + 1]['text'].strip()
+            
+            good_end_point = (
+                curr_text.endswith(('.', '!', '?')) and
+                (not next_text or next_text[0].isupper())
+            )
+            
+            # If we have a good end point and reasonable duration, consider stopping
+            if good_end_point and curr_duration >= 45.0:
+                # If we're close to target duration or next segment would be too long, stop here
+                if abs(curr_duration - 60.0) <= 15.0 or next_duration > 75.0:
                     break
-            end_segment_idx -= 1
-        
-        # If we had to backtrack too far, try going forward instead
-        if transcript_segments[end_segment_idx]['end'] < target_end_time - 20:
-            end_segment_idx = original_end_idx
-            # Try going forward to find a good ending point
-            while end_segment_idx < len(transcript_segments) - 1:
-                curr_text = transcript_segments[end_segment_idx]['text'].strip()
-                next_text = transcript_segments[end_segment_idx + 1]['text'].strip()
-                
-                # Calculate duration if we were to include the next segment
-                next_end = transcript_segments[end_segment_idx + 1]['end']
-                potential_duration = next_end - segment_start
-                
-                # Check if current segment is a good ending point
-                good_end_point = (curr_text.endswith(('.', '!', '?')) and 
-                               (not next_text or next_text[0].isupper()))
-                
-                if good_end_point:
-                    # If we have a good end point and decent length, stop here
-                    if transcript_segments[end_segment_idx]['end'] - segment_start >= 45:
-                        break
-                
-                # If adding next segment exceeds 65 seconds, stop at current if it's a decent endpoint
-                if potential_duration > 65 and good_end_point:
-                    break
-                
-                # Otherwise, continue if we haven't exceeded max duration
-                if potential_duration <= 67:  # Allow slightly longer for proper sentence completion
-                    end_segment_idx += 1
-                else:
-                    break
+            
+            end_segment_idx += 1
         
         segment_end = transcript_segments[end_segment_idx]['end']
         
-        # Always include a small buffer at the end to avoid cutting off words
+        # Add small buffer at the end to avoid cutting off words
         if end_segment_idx < len(transcript_segments) - 1:
             next_start = transcript_segments[end_segment_idx + 1]['start']
             next_end = transcript_segments[end_segment_idx + 1]['end']
-            # Look ahead up to 2 seconds to include sentence completion
-            if next_start - segment_end <= 0.5:  # If there's a small gap
-                # Check if including the next segment would make it too long
-                if next_end - segment_start <= 67:  # Still within our max duration
-                    segment_end = next_end
+            
+            # If there's a small gap and including it wouldn't make segment too long
+            if next_start - segment_end <= 0.3 and next_end - segment_start <= 90.0:
+                segment_end = next_end
         
-        # Only return if segment is of acceptable length
+        # Verify final duration is within bounds
         duration = segment_end - segment_start
-        if 30 <= duration <= 90:  # More flexible duration range 
+        if 30.0 <= duration <= 90.0:
             return (segment_start, segment_end)
+        
         return None
 
     def _merge_overlapping_segments(self, segments: List[Tuple[float, float]]) -> List[Tuple[float, float]]: 
@@ -863,40 +706,36 @@ class SegmentSelector:
             new_duration = end - current_start
             gap = start - current_end
             
-            # If there's a significant gap, or merging would exceed duration limits,
-            # save current segment and start new one
-            if gap >= self.min_segment_gap or new_duration > self.max_duration:
-                if self.min_duration <= current_duration <= self.max_duration:
-                    merged_segments.append((current_start, current_end))
-                current_start, current_end = start, end
-            else:
-                # Extend current segment if it won't exceed max duration
-                if new_duration <= self.max_duration:
-                    current_end = max(current_end, end)
-                else:
-                    # If current segment meets duration requirements, save it
-                    if self.min_duration <= current_duration <= self.max_duration:
-                        merged_segments.append((current_start, current_end))
-                    current_start, current_end = start, end
+            # If there's a small gap (< 3s), check if we should merge
+            if gap < 3.0 and new_duration <= self.max_duration:
+                # Only merge if the gap contains speech (check audio features)
+                gap_intensity = self._get_audio_score(current_end, start, self.audio_features)
+                if gap_intensity > 0.4:  # There's significant speech in the gap
+                    current_end = end
+                    continue
+            
+            # Save current segment and start new one
+            if self.min_duration <= current_duration <= self.max_duration:
+                merged_segments.append((current_start, current_end))
+            current_start, current_end = start, end
         
         # Handle the final segment
         final_duration = current_end - current_start
         if self.min_duration <= final_duration <= self.max_duration:
             merged_segments.append((current_start, current_end))
         
-        # Verify no overlaps in final result
-        for i in range(len(merged_segments)-1):
-            current_end = merged_segments[i][1]
-            next_start = merged_segments[i+1][0]
-            if next_start - current_end < self.min_segment_gap:
-                self.logger.warning(f"Found segments too close together after merging: {current_end:.1f} to {next_start:.1f}")
-                # Skip segments that are too close together
-                return [s for i, s in enumerate(merged_segments) if i == 0 or 
-                       merged_segments[i][0] - merged_segments[i-1][1] >= self.min_segment_gap]
+        # Ensure minimum spacing between segments
+        final_segments = []
+        for i, (start, end) in enumerate(merged_segments):
+            if i == 0 or start - final_segments[-1][1] >= 3.0:  # Minimum 3s gap
+                final_segments.append((start, end))
+            else:
+                self.logger.debug(
+                    f"Skipping segment {start:.1f}-{end:.1f} due to insufficient "
+                    f"spacing from previous segment (gap: {start - final_segments[-1][1]:.1f}s)"
+                )
         
         self.logger.debug(
-            f"Merged {len(segments)} segments into {len(merged_segments)} segments\n" +
-            "\n".join(f"Duration: {end-start:.1f}s ({start:.1f}-{end:.1f})" 
-                     for start, end in merged_segments)
+            f"Merged {len(segments)} segments into {len(final_segments)} non-overlapping segments"
         )
-        return merged_segments
+        return final_segments

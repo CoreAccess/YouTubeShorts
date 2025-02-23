@@ -30,19 +30,54 @@ def find_speaker_turn(time: float, turns: List[SpeakerTurn]) -> Optional[Speaker
             return turn
     return None
 
-def merge_transcript_and_diarization(transcript_data: Dict[str, Any], diarization_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """
-    Merge transcript segments with speaker diarization data.
-    Maintains conversation flow and ensures proper speaker attribution.
-    """
+def merge_transcript_and_diarization(
+    transcript_data: Dict[str, Any], 
+    diarization_data: Dict[str, List[Dict[str, Any]]],
+    audio_features: Optional[List[Any]] = None
+) -> Dict[str, Any]:
     logger = logging.getLogger('youtube_shorts')
     
+    def is_overlapping_conversation(new_start: float, new_end: float, conversations: Dict) -> bool:
+        """Check if a new conversation would overlap with existing ones"""
+        for conv_data in conversations.values():
+            overlap_start = max(new_start, conv_data["start"])
+            overlap_end = min(new_end, conv_data["end"])
+            if overlap_end > overlap_start:
+                overlap_duration = overlap_end - overlap_start
+                if overlap_duration > 3.5 and (overlap_duration / (new_end - new_start)) > 0.15:  # More lenient overlap check
+                    return True
+        return False
+
     try:
         # If no diarization data, return original transcript
         if not diarization_data["segments"]:
             return transcript_data
+
+        def get_audio_intensity(start: float, end: float) -> float:
+            """Get average audio intensity for a time range"""
+            if not audio_features:
+                return 0.5
             
-        # First, create speaker turns from diarization data
+            relevant_features = [
+                f for f in audio_features
+                if f.start <= end and f.end >= start
+            ]
+            if not relevant_features:
+                return 0.5
+            
+            weighted_sum = 0
+            total_weight = 0
+            for feature in relevant_features:
+                overlap_start = max(start, feature.start)
+                overlap_end = min(end, feature.end)
+                overlap_duration = overlap_end - overlap_start
+                weight = overlap_duration / (end - start)
+                weighted_sum += feature.intensity_score * weight
+                total_weight += weight
+            
+            return weighted_sum / total_weight if total_weight > 0 else 0.5
+            
+        # Create speaker turns from diarization data
         speaker_turns = []
         for segment in diarization_data["segments"]:
             turn = SpeakerTurn(
@@ -60,39 +95,83 @@ def merge_transcript_and_diarization(transcript_data: Dict[str, Any], diarizatio
         current_conversation_id = 0
         last_speaker = None
         last_end_time = 0
+        conversation_speakers = set()
+        conversation_start = 0
+        conversation_segments = []
+        conversations = {}  # Track all conversations for overlap checking
         
         for segment in transcript_data["segments"]:
             segment_mid = (segment["start"] + segment["end"]) / 2
             current_turn = find_speaker_turn(segment_mid, speaker_turns)
             
-            # Create new segment with speaker information
             new_segment = segment.copy()
             
             if current_turn:
                 new_segment["speaker"] = current_turn.speaker
-                
-                # Check if this is part of the same conversation
                 time_gap = segment["start"] - last_end_time
                 speaker_changed = last_speaker != current_turn.speaker
+                current_duration = segment["end"] - conversation_start
                 
-                # Start new conversation if:
-                # 1. Large time gap (> 2s)
-                # 2. Speaker changed and gap > 0.5s
-                if (time_gap > 2.0) or (speaker_changed and time_gap > 0.5):
+                # Enhanced conversation break detection
+                should_start_new = False
+                
+                # Check audio intensity during gap
+                gap_intensity = get_audio_intensity(last_end_time, segment["start"]) if time_gap > 0.5 else 1.0
+                
+                # More lenient conversation break conditions but maintain duration limits
+                if (
+                    # Long silence gap with very low audio intensity
+                    (time_gap > 2.5 and gap_intensity < 0.25) or
+                    # Speaker change with significant gap and low intensity
+                    (speaker_changed and time_gap > 0.75 and gap_intensity < 0.35) or
+                    # Strict duration limit
+                    current_duration > 90.0 or
+                    # Speaker limit slightly relaxed
+                    (current_turn.speaker not in conversation_speakers and len(conversation_speakers) >= 4) or
+                    # Natural conversation end with more lenient conditions
+                    (speaker_changed and time_gap > 0.5 and 
+                     conversation_segments and conversation_segments[-1]["text"].strip().endswith(('.', '!', '?'))) or
+                    # Check overlap with existing conversations
+                    (conversation_segments and 
+                     is_overlapping_conversation(conversation_start, segment["end"], conversations))
+                ):
+                    # Only break if current conversation meets minimum requirements
+                    if conversation_segments:
+                        conv_duration = conversation_segments[-1]["end"] - conversation_segments[0]["start"]
+                        conv_intensity = get_audio_intensity(conversation_segments[0]["start"], conversation_segments[-1]["end"])
+                        
+                        # Maintain strict 30s minimum but be more lenient with other criteria
+                        if (30.0 <= conv_duration <= 90.0 and 
+                            (len(conversation_speakers) > 1 or conv_intensity > 0.55)):  # More lenient intensity requirement
+                            conversations[f"conv_{current_conversation_id}"] = {
+                                "start": conversation_segments[0]["start"],
+                                "end": conversation_segments[-1]["end"]
+                            }
+                            should_start_new = True
+                
+                if should_start_new:
                     current_conversation_id += 1
+                    conversation_speakers = {current_turn.speaker}
+                    conversation_start = segment["start"]
+                    conversation_segments = []
+                else:
+                    conversation_speakers.add(current_turn.speaker)
                 
                 new_segment["conversation_id"] = f"conv_{current_conversation_id}"
                 last_speaker = current_turn.speaker
+                conversation_segments.append(new_segment)
             else:
                 new_segment["speaker"] = "UNKNOWN"
-                # Unknown speaker segments start new conversations
                 current_conversation_id += 1
                 new_segment["conversation_id"] = f"conv_{current_conversation_id}"
                 last_speaker = None
+                conversation_speakers = set()
+                conversation_start = segment["start"]
+                conversation_segments = [new_segment]
             
             last_end_time = segment["end"]
             
-            # Process words if available
+            # Process words with speaker attribution
             if "words" in segment:
                 for word in segment["words"]:
                     word_mid = (word["start"] + word["end"]) / 2
@@ -104,37 +183,32 @@ def merge_transcript_and_diarization(transcript_data: Dict[str, Any], diarizatio
         # Update transcript with processed segments
         transcript_data["segments"] = processed_segments
         
-        # Add conversation metadata
-        conversations = {}
-        for segment in processed_segments:
-            conv_id = segment["conversation_id"]
-            if conv_id not in conversations:
-                conversations[conv_id] = {
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "speakers": set([segment["speaker"]]),
-                    "turns": 1
-                }
+        # Add conversation metadata with audio features and ensure no significant overlaps
+        valid_conversations = {}
+        for conv_id, data in conversations.items():
+            # Skip conversations that overlap with already validated ones
+            if not is_overlapping_conversation(data["start"], data["end"], valid_conversations):
+                if (30.0 <= data["duration"] <= 90.0 and
+                    (len(data["speakers"]) > 1 or data["intensity"] > 0.6)):
+                    valid_conversations[conv_id] = data
             else:
-                conv = conversations[conv_id]
-                conv["end"] = segment["end"]
-                if segment["speaker"] not in conv["speakers"]:
-                    conv["speakers"].add(segment["speaker"])
-                    conv["turns"] += 1
+                logger.debug(f"Skipping overlapping conversation {conv_id}")
         
-        # Add conversation metadata to transcript
+        # Add filtered conversation metadata to transcript
         transcript_data["conversations"] = [
             {
                 "id": conv_id,
                 "start": data["start"],
                 "end": data["end"],
                 "speaker_count": len(data["speakers"]),
-                "turn_count": data["turns"]
+                "turn_count": data["turns"],
+                "duration": data["duration"],
+                "intensity": data["intensity"]
             }
-            for conv_id, data in conversations.items()
+            for conv_id, data in valid_conversations.items()
         ]
         
-        # Add list of unique speakers
+        # Update unique speakers list
         transcript_data["speakers"] = list(set(
             segment["speaker"] 
             for segment in processed_segments 
